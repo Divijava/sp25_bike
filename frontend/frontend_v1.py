@@ -1,77 +1,83 @@
-import sys
-from pathlib import Path
-sys.path.append(str(Path(__file__).parent.parent))
-
 import streamlit as st
 import pandas as pd
-from datetime import datetime
-from zoneinfo import ZoneInfo
+import pytz
+from datetime import datetime, timedelta
 from streamlit_folium import st_folium
-import folium
-import plotly.express as px
 
 from src.config import DATA_DIR
-from src.inference import fetch_next_hour_predictions, load_batch_of_features_from_store
-from src.plot_utils import plot_prediction
+from src.inference import (
+    get_model_predictions,
+    load_batch_of_features_from_store,
+    load_model_from_registry,
+    load_metrics_from_registry,
+)
+from src.plot_utils import plot_aggregated_time_series
+from src.data_utils import load_shape_data_file, create_taxi_map
 
-# Set page config
-st.set_page_config(page_title="🚲 Citi Bike Demand Forecast", layout="wide")
+# NYC timezone
+nyc_tz = pytz.timezone("America/New_York")
+current_time_utc = datetime.utcnow().replace(tzinfo=pytz.utc)
+current_time_nyc = current_time_utc.astimezone(nyc_tz)
 
-# 🕒 Get current NYC time
-current_date = pd.Timestamp.now(tz=ZoneInfo("America/New_York"))
+# UI
+st.set_page_config(layout="wide")
+st.title("Citi Bike Demand Prediction (Next Hour)")
+st.subheader(f"Current NYC Time: {current_time_nyc.strftime('%Y-%m-%d %H:%M:%S %Z')}")
 
-# Header
-st.title("🚲 Citi Bike Demand Prediction")
-st.markdown(f"🕒 **Prediction Time (New York):** `{current_date.strftime('%Y-%m-%d %I:%M %p %Z')}``")
+# Progress bar
+progress_bar = st.sidebar.progress(0)
+N_STEPS = 5
 
-# Sidebar controls
-with st.sidebar:
-    st.header("Controls")
-    station_id = st.selectbox("Select Station ID:", options=list(range(1, 11)))
-    progress = st.progress(0)
+# Step 1: Load NYC zone shapefile
+with st.spinner("Loading NYC zone shapefile..."):
+    shapefile = load_shape_data_file(DATA_DIR)
+    st.sidebar.success("Shapefile loaded")
+    progress_bar.progress(1 / N_STEPS)
 
-# Load features and predictions
-progress.progress(0.2)
-features = load_batch_of_features_from_store(current_date)
-progress.progress(0.6)
-predictions = fetch_next_hour_predictions(current_date)
-progress.progress(1.0)
+# Step 2: Load features
+with st.spinner("Loading features from Hopsworks..."):
+    features = load_batch_of_features_from_store(current_time_utc)
+    st.sidebar.success("Features loaded")
+    progress_bar.progress(2 / N_STEPS)
 
-# Display map
-st.subheader("📍 NYC Predicted Bike Demand Map")
-pred_map = predictions.copy()
-pred_map['Latitude'] = 40.75 + (pred_map.index % 10) * 0.01
-pred_map['Longitude'] = -73.99 + (pred_map.index % 10) * 0.01
+# Step 3: Load model
+with st.spinner("Loading model from registry..."):
+    model = load_model_from_registry()
+    st.sidebar.success("Model loaded")
+    progress_bar.progress(3 / N_STEPS)
 
-m = folium.Map(location=[40.75, -73.99], zoom_start=12)
-for _, row in pred_map.iterrows():
-    folium.CircleMarker(
-        location=[row["Latitude"], row["Longitude"]],
-        radius=row["predicted_demand"] / 10,
-        popup=f"Zone {row['pickup_location_id']}<br>{row['predicted_demand']:.1f} trips",
-        color="blue",
-        fill=True,
-    ).add_to(m)
-st_folium(m, width=800, height=500)
+# Step 4: Predict
+with st.spinner("Making predictions..."):
+    predictions = get_model_predictions(model, features)
+    predictions["pickup_hour"] = current_time_nyc.replace(minute=0, second=0, microsecond=0)
+    st.sidebar.success("Predictions ready")
+    progress_bar.progress(4 / N_STEPS)
 
-# Metrics
-st.subheader("📊 Prediction Stats")
-col1, col2, col3 = st.columns(3)
-col1.metric("Max Rides", f"{predictions['predicted_demand'].max():.0f}")
-col2.metric("Min Rides", f"{predictions['predicted_demand'].min():.0f}")
-col3.metric("Avg Rides", f"{predictions['predicted_demand'].mean():.0f}")
+# Step 5: Map + Plot
+with st.spinner("Generating map and plots..."):
+    st.subheader("📍 Predicted Demand Map")
+    map_ = create_taxi_map(shapefile, predictions)
+    st_folium(map_, width=800, height=600)
 
-# Top 10 predictions
-st.subheader("📈 Top 10 Zones by Demand")
-top10 = predictions.sort_values("predicted_demand", ascending=False).head(10)
-st.dataframe(top10)
+    st.subheader("📊 Prediction Stats")
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Average Rides", f"{predictions['predicted_demand'].mean():.2f}")
+    col2.metric("Max Rides", f"{predictions['predicted_demand'].max():.0f}")
+    col3.metric("Min Rides", f"{predictions['predicted_demand'].min():.0f}")
 
-# Plots
-for zone_id in top10["pickup_location_id"]:
-    st.plotly_chart(
-        plot_prediction(
-            features=features[features["pickup_location_id"] == zone_id],
-            prediction=predictions[predictions["pickup_location_id"] == zone_id]
-        ),
-        use_container_width=True
+    st.dataframe(predictions.sort_values("predicted_demand", ascending=False).head(10))
+    top10 = (
+        predictions.sort_values("predicted_demand", ascending=False).head(10)[
+            "pickup_location_id"
+        ].tolist()
     )
+    for location_id in top10:
+        fig = plot_aggregated_time_series(
+            features=features,
+            targets=predictions["predicted_demand"],
+            row_id=location_id,
+            predictions=predictions["predicted_demand"],
+        )
+        st.plotly_chart(fig, theme="streamlit", use_container_width=True)
+    progress_bar.progress(1.0)
+    st.success("App finished!")
