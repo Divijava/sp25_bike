@@ -74,9 +74,10 @@ st_folium(m, width=800, height=500)
 # Metrics
 st.subheader("📊 Prediction Stats")
 col1, col2, col3 = st.columns(3)
-col1.metric("Max Rides", f"{predictions['predicted_demand'].max():.0f}")
-col2.metric("Min Rides", f"{predictions['predicted_demand'].min():.0f}")
-col3.metric("Avg Rides", f"{predictions['predicted_demand'].mean():.0f}")
+col1.metric("Max Rides", f"{abs(predictions['predicted_demand'].max()):.0f}")
+col2.metric("Min Rides", f"{abs(predictions['predicted_demand'].min()):.0f}")
+col3.metric("Avg Rides", f"{abs(predictions['predicted_demand'].mean()):.0f}")
+
 
 # Top 10 predictions
 st.subheader("📈 Top 10 Zones by Predicted Demand")
