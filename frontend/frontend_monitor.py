@@ -1,59 +1,76 @@
-import sys
-from pathlib import Path
-
-# Add project root to sys.path
-parent_dir = str(Path(__file__).parent.parent)
-sys.path.append(parent_dir)
-
-import pandas as pd
-import plotly.express as px
 import streamlit as st
+import pandas as pd
+import pytz
+from datetime import datetime
+from pathlib import Path
+import sys
+from streamlit_folium import st_folium
+import folium
+import plotly.express as px
 
-from src.inference import fetch_hourly_rides, fetch_predictions
+# Setup imports
+sys.path.append(str(Path(__file__).parent.parent))
+from src.config import DATA_DIR
+from src.inference import fetch_next_hour_predictions, load_batch_of_features_from_store
+from src.plot_utils import plot_prediction
 
-st.set_page_config(layout="wide")
-st.title("Citi Bike Prediction Monitor: Mean Absolute Error (MAE) by Pickup Hour")
 
-# Sidebar for user input
-st.sidebar.header("Settings")
-past_hours = st.sidebar.slider(
-    "Number of Past Hours to Plot",
-    min_value=12,
-    max_value=24 * 28,  # 4 weeks
-    value=24,  # Default
-    step=1,
-)
+# App config
+st.set_page_config(page_title="🚲 Citi Bike Forecast", layout="wide")
 
-# Fetch data
-st.write("Fetching Citi Bike predictions and actuals for the past", past_hours, "hours...")
-df_actual = fetch_hourly_rides(past_hours)
-df_pred = fetch_predictions(past_hours)
+# Header
+nyc_tz = pytz.timezone("America/New_York")
+current_time = pd.Timestamp.now(tz="UTC").tz_convert(nyc_tz)
+st.title("🚲 Citi Bike Demand Prediction")
+st.markdown(f"**Prediction Time:** {current_time.strftime('%Y-%m-%d %H:%M:%S %Z')}")
 
-# Merge actual and predicted
-merged_df = pd.merge(df_actual, df_pred, on=["pickup_location_id", "pickup_hour"])
+# Sidebar inputs
+with st.sidebar:
+    st.header("Prediction Controls")
+    station_id = st.selectbox("Select Station ID:", options=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
+    progress_bar = st.progress(0)
 
-# Calculate MAE per hour
-merged_df["absolute_error"] = abs(merged_df["predicted_demand"] - merged_df["rides"])
-mae_by_hour = (
-    merged_df.groupby("pickup_hour")["absolute_error"]
-    .mean()
-    .reset_index()
-    .rename(columns={"absolute_error": "MAE"})
-)
+# Load features and predictions
+progress_bar.progress(0.2)
+features = load_batch_of_features_from_store(current_time)
+progress_bar.progress(0.5)
+predictions = fetch_next_hour_predictions()
+progress_bar.progress(0.8)
 
-# Plot
-fig = px.line(
-    mae_by_hour,
-    x="pickup_hour",
-    y="MAE",
-    title=f"Mean Absolute Error (MAE) for the Past {past_hours} Hours",
-    labels={"pickup_hour": "Pickup Hour", "MAE": "Mean Absolute Error"},
-    markers=True,
-    template="plotly_dark",
-)
+# Map
+st.subheader("📍 Predicted Demand Map (NYC)")
+map_df = predictions.copy()
+map_df['Latitude'] = 40.75 + (map_df.index % 10) * 0.01  # Simulated lat/lon
+map_df['Longitude'] = -73.99 + (map_df.index % 10) * 0.01
 
-st.plotly_chart(fig, use_container_width=True)
+m = folium.Map(location=[40.75, -73.99], zoom_start=12)
+for _, row in map_df.iterrows():
+    folium.CircleMarker(
+        location=[row['Latitude'], row['Longitude']],
+        radius=row['predicted_demand'] / 10,
+        popup=f"Zone {row['pickup_location_id']}<br>Predicted: {row['predicted_demand']:.1f}",
+        color="blue",
+        fill=True,
+    ).add_to(m)
 
-# Display MAE stats
-st.subheader(" MAE Summary")
-st.metric("Average MAE", f"{mae_by_hour['MAE'].mean():.3f}")
+st_folium(m, width=800, height=600)
+progress_bar.progress(1.0)
+
+# Metrics
+st.subheader("📊 Prediction Stats")
+col1, col2, col3 = st.columns(3)
+col1.metric("Max", f"{predictions['predicted_demand'].max():.0f}")
+col2.metric("Min", f"{predictions['predicted_demand'].min():.0f}")
+col3.metric("Avg", f"{predictions['predicted_demand'].mean():.0f}")
+
+# Top 10 plot
+st.subheader("📈 Top 10 Zones by Demand")
+top10 = predictions.sort_values("predicted_demand", ascending=False).head(10)
+st.dataframe(top10)
+
+for location_id in top10["pickup_location_id"]:
+    fig = plot_prediction(
+        features=features[features["pickup_location_id"] == location_id],
+        prediction=predictions[predictions["pickup_location_id"] == location_id]
+    )
+    st.plotly_chart(fig, use_container_width=True)
