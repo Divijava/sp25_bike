@@ -1,76 +1,84 @@
+import sys
+from pathlib import Path
+sys.path.append(str(Path(__file__).parent.parent))
+
 import streamlit as st
 import pandas as pd
-import pytz
-from datetime import datetime
-from pathlib import Path
-import sys
-from streamlit_folium import st_folium
-import folium
 import plotly.express as px
+from datetime import datetime
+from src.inference import fetch_predictions, fetch_hourly_rides
 
-# Setup imports
-sys.path.append(str(Path(__file__).parent.parent))
-from src.config import DATA_DIR
-from src.inference import fetch_next_hour_predictions, load_batch_of_features_from_store
-from src.plot_utils import plot_prediction
+# Page Setup
+st.set_page_config(page_title="🚲 Citi Bike Monitoring", layout="wide")
+st.markdown("""
+    <style>
+    .big-metric { font-size: 22px; font-weight: bold; }
+    </style>
+""", unsafe_allow_html=True)
 
+st.markdown("<h1 style='text-align: center;'>📉 Citi Bike Demand Monitoring</h1>", unsafe_allow_html=True)
+st.caption("Last refresh: " + datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
-# App config
-st.set_page_config(page_title="🚲 Citi Bike Forecast", layout="wide")
-
-# Header
-nyc_tz = pytz.timezone("America/New_York")
-current_time = pd.Timestamp.now(tz="UTC").tz_convert(nyc_tz)
-st.title("🚲 Citi Bike Demand Prediction")
-st.markdown(f"**Prediction Time:** {current_time.strftime('%Y-%m-%d %H:%M:%S %Z')}")
-
-# Sidebar inputs
+# Sidebar Controls
 with st.sidebar:
-    st.header("Prediction Controls")
-    station_id = st.selectbox("Select Station ID:", options=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
-    progress_bar = st.progress(0)
+    st.header("⚙️ Settings")
+    past_hours = st.slider("⏱ Lookback window (hours):", 6, 72, 24)
+    st.success("Data loaded from last {} hours".format(past_hours))
+    st.button("🔁 Refresh Dashboard", help="Click to rerun app manually (Streamlit auto-refreshes on change)")
 
-# Load features and predictions
-progress_bar.progress(0.2)
-features = load_batch_of_features_from_store(current_time)
-progress_bar.progress(0.5)
-predictions = fetch_next_hour_predictions()
-progress_bar.progress(0.8)
+# Load data
+actual_df = fetch_hourly_rides(past_hours)
+pred_df = fetch_predictions(past_hours)
+merged = actual_df.merge(pred_df, on=["pickup_hour", "pickup_location_id"])
+merged["abs_error"] = abs(merged["rides"] - merged["predicted_demand"])
+merged["squared_error"] = (merged["rides"] - merged["predicted_demand"]) ** 2
 
-# Map
-st.subheader("📍 Predicted Demand Map (NYC)")
-map_df = predictions.copy()
-map_df['Latitude'] = 40.75 + (map_df.index % 10) * 0.01  # Simulated lat/lon
-map_df['Longitude'] = -73.99 + (map_df.index % 10) * 0.01
-
-m = folium.Map(location=[40.75, -73.99], zoom_start=12)
-for _, row in map_df.iterrows():
-    folium.CircleMarker(
-        location=[row['Latitude'], row['Longitude']],
-        radius=row['predicted_demand'] / 10,
-        popup=f"Zone {row['pickup_location_id']}<br>Predicted: {row['predicted_demand']:.1f}",
-        color="blue",
-        fill=True,
-    ).add_to(m)
-
-st_folium(m, width=800, height=600)
-progress_bar.progress(1.0)
+# Filter for valid MAPE calc
+non_zero_actuals = merged[merged["rides"] != 0].copy()
+non_zero_actuals["ape"] = abs((non_zero_actuals["rides"] - non_zero_actuals["predicted_demand"]) / non_zero_actuals["rides"]) * 100
 
 # Metrics
-st.subheader("📊 Prediction Stats")
+mae = merged["abs_error"].mean()
+rmse = (merged["squared_error"].mean()) ** 0.5
+mape = non_zero_actuals["ape"].mean() if not non_zero_actuals.empty else None
+
+# Metric Display
+st.markdown("### 📊 Current Model Stats")
 col1, col2, col3 = st.columns(3)
-col1.metric("Max", f"{predictions['predicted_demand'].max():.0f}")
-col2.metric("Min", f"{predictions['predicted_demand'].min():.0f}")
-col3.metric("Avg", f"{predictions['predicted_demand'].mean():.0f}")
+col1.metric("📈 MAE", f"{mae:.2f}")
+col2.metric("📉 MAPE", f"{mape:.2f}%" if mape else "N/A")
+col3.metric("📏 RMSE", f"{rmse:.2f}")
 
-# Top 10 plot
-st.subheader("📈 Top 10 Zones by Demand")
-top10 = predictions.sort_values("predicted_demand", ascending=False).head(10)
-st.dataframe(top10)
+st.markdown("---")
 
-for location_id in top10["pickup_location_id"]:
-    fig = plot_prediction(
-        features=features[features["pickup_location_id"] == location_id],
-        prediction=predictions[predictions["pickup_location_id"] == location_id]
-    )
-    st.plotly_chart(fig, use_container_width=True)
+# Line Chart
+st.markdown("### 📈 MAE Trend Over Time")
+hourly_mae = merged.groupby("pickup_hour")["abs_error"].mean().reset_index()
+fig = px.line(
+    hourly_mae,
+    x="pickup_hour",
+    y="abs_error",
+    title="Hourly Mean Absolute Error",
+    markers=True
+)
+fig.update_traces(line=dict(color="royalblue", width=3), marker=dict(size=7))
+fig.update_layout(title_font_size=18, xaxis_title="Time", yaxis_title="MAE")
+st.plotly_chart(fig, use_container_width=True)
+
+# Raw Table View
+st.markdown("### 🔍 Highest Prediction Errors")
+top_errors = merged.sort_values("abs_error", ascending=False).head(15)[
+    ["pickup_hour", "pickup_location_id", "rides", "predicted_demand", "abs_error", "squared_error"]
+]
+
+with st.expander("📋 View Top 15 Errors", expanded=True):
+    st.dataframe(top_errors.style.background_gradient(cmap="Reds", subset=["abs_error"]))
+
+# CSV download
+csv = top_errors.to_csv(index=False).encode("utf-8")
+st.download_button(
+    label="💾 Download Top Errors as CSV",
+    data=csv,
+    file_name="top_prediction_errors.csv",
+    mime="text/csv",
+)
